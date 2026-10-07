@@ -411,7 +411,7 @@ Keep `TTX_SALT` only in a local `.env` file. Git ignores this file. Do not print
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **30 passed** (also 30 passed in a clean environment with the dev extra only) | `pytest -q` |
+| Unit tests (CI installs only `.[dev]`) | **30 passed**, 0 skipped. No test needs an optional extra | `pytest -q` |
 | Patterns on the check set (60 sentences) | Precision 0.903 (Wilson 0.751 – 0.967), recall 1.000 (0.879 – 1.000), F1 0.949 | `twitter-to-x validate-moderation` |
 | Substring baseline on the check set | Precision 0.382, recall 0.464, F1 0.419 | `twitter-to-x validate-moderation` |
 | Offline demo (synthetic posts) | See the table below | `twitter-to-x demo` |
