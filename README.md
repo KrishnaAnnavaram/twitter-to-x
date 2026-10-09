@@ -71,6 +71,7 @@ This README is the **one location that explains all of twitter-to-x**. It gives 
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one post](#42-the-life-cycle-of-one-post)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Data preparation](#5-data-preparation)
 6. 🟢 [Sentiment scorers](#6-sentiment-scorers)
 7. 🟣 [Moderation patterns and topics](#7-moderation-patterns-and-topics)
@@ -138,6 +139,53 @@ flowchart LR
 | Study | `src/twitter_to_x/analysis.py` | Prepare, score, analyze, report |
 | CLI | `src/twitter_to_x/cli.py` | The `twitter-to-x` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry point"]
+        CLI["cli.py<br/>twitter-to-x command"]
+        CFG["config.py<br/>load_settings"]
+    end
+    subgraph DATA["data/"]
+        SRC["sources.py<br/>load_sources, assign_period"]
+        ANO["anonymize.py<br/>hash_author, mask_text, new_salt"]
+        FIL["filters.py<br/>apply_filters"]
+        SMP["sampling.py<br/>balanced_periods, sortedness"]
+        SYN["synthetic.py<br/>make_posts"]
+    end
+    subgraph SCORE["Scoring"]
+        TXT["text.py<br/>light_clean, topic_tokens"]
+        SEN["sentiment/<br/>build_scorer"]
+        MOD["moderation/detector.py<br/>ModerationDetector"]
+        VAL["moderation/validate.py<br/>evaluate_flags, gold.csv"]
+    end
+    subgraph STUDY["Study"]
+        ANA["analysis.py<br/>prepare, score, analyze, write_report"]
+        TOP["topics.py<br/>TopicModel, prevalence"]
+        STA["stats.py<br/>chi_square, diff_ci, logistic_regression"]
+    end
+
+    CLI --> CFG
+    CLI --> ANO
+    CLI --> SRC
+    CLI --> SYN
+    CLI --> SEN
+    CLI --> MOD
+    CLI --> VAL
+    CLI --> ANA
+    SRC --> ANO
+    TXT --> ANO
+    ANA --> SRC
+    ANA --> FIL
+    ANA --> SMP
+    ANA --> TXT
+    ANA --> MOD
+    ANA --> TOP
+    ANA --> STA
+    TOP --> TXT
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -183,6 +231,15 @@ twitter-to-x/
 ### 3.3 Sentiment on the light view
 The scorers read the light view: handles and links masked, nothing else changed. Stop-word removal and lower case exist only in the topic view.
 
+```mermaid
+flowchart LR
+    RAW[/"Post text from the loader<br/>handles and links masked"/] --> LV["light_clean<br/>decode HTML entities, collapse spaces"]
+    LV --> SC["Sentiment scorer<br/>sees case, ! and not"]
+    LV --> PAT["Moderation patterns"]
+    LV --> TV["topic_tokens<br/>lower case, no stop words,<br/>words of 3 letters or more"]
+    TV --> NMF["TF-IDF + NMF topics"]
+```
+
 ### 3.4 Patterns with word boundaries
 Every moderation pattern has `\b` boundaries and explicit word forms. Generic words such as "removed" count only after "tweet", "post" or "account". A labelled check set measures precision and recall.
 
@@ -205,25 +262,65 @@ The loaders hash authors with a salt and mask handles. `scores.csv` has no text 
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    S1["Sentiment140 / X parquet / CSV"] --> L["loaders: post schema, hash authors, mask handles"]
-    L --> P["assign period by cutoff"]
-    P --> F["filter rules: empty, bots, duplicates, language, spam"]
-    F --> SMP["random equal samples per period"]
-    SMP --> LV["light view"]
-    LV --> SENT["scorer: sentiment, compound, status"]
-    LV --> MOD["patterns: moderation talk + categories"]
-    LV --> TOP["topic view -> one NMF model"]
-    SENT --> ST["statistics: chi-square, intervals, standardization, regression"]
-    MOD --> ST
-    TOP --> ST
-    ST --> REP["report.json + report.md"]
+flowchart TD
+    S1[/"Sentiment140 CSV, X parquet chunk<br/>or CSV with timestamps"/] --> L["load_sources<br/>post schema, hash authors,<br/>mask handles and links"]
+    SALT[/"TTX_SALT or a new random salt"/] --> L
+    L --> V{"validate_posts<br/>columns, timestamps,<br/>unique post ids?"}
+    V -- "no" --> ERR[/"SchemaError"/]
+    V -- "yes" --> P["assign_period<br/>pre or post by TTX_CUTOFF"]
+    P --> F["apply_filters: empty, repeated_author_text,<br/>duplicate_text, not_english, spam_pattern"]
+    F --> SMP["balanced_periods<br/>random equal samples"]
+    SMP --> LV["light_clean"]
+    LV --> PREP[("data/prepared<br/>posts.csv, manifest.json")]
+    PREP --> SENT["Scorer: lexicon, vader or transformer<br/>sentiment, compound, status"]
+    PREP --> MOD["ModerationDetector<br/>flag and categories"]
+    SENT --> SCORES[("results/ for each scorer<br/>scores.csv, no text")]
+    MOD --> SCORES
+    SCORES --> AN["analyze: exclude errors, shares, chi-square,<br/>shared topics, standardization, regression"]
+    AN --> REP[/"report.json, report.md"/]
+    LAB{{"HUMAN<br/>label a random sample of posts"}} --> GOLD[/"Labelled sample<br/>text, label"/]
+    GOLD --> VM["validate-moderation<br/>precision, recall, Wilson intervals"]
+    REP --> REV{{"HUMAN<br/>review each conclusion<br/>before publication"}}
+    VM --> REV
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class LAB,REV human
 ```
 
 ### 4.2 The life cycle of one post
 
-1. The loader reads the post, hashes the author and masks the handles in the text.
-2. The loader parses the timestamp to UTC and gives the post a period.
+```mermaid
+stateDiagram-v2
+    state "Raw post" as Raw
+    state "Loaded and anonymized" as Loaded
+    state "Dated, pre or post" as Dated
+    state "Removed by a filter rule" as Removed
+    state "Kept" as Kept
+    state "Not drawn" as NotDrawn
+    state "In the sample, light view" as Sampled
+    state "Scored, status ok" as Ok
+    state "Scored, status error" as Failed
+    state "Flagged and given a topic" as Tagged
+    state "Counted in the tables" as Counted
+    [*] --> Raw
+    Raw --> Loaded: loader, hash_author, mask_text
+    Loaded --> Dated: assign_period
+    Dated --> Removed: empty, repeated_author_text, duplicate_text, not_english or spam_pattern
+    Dated --> Kept: passes all rules
+    Kept --> NotDrawn: not drawn at random
+    Kept --> Sampled: balanced_periods, light_clean
+    Sampled --> Ok: scorer
+    Sampled --> Failed: transformer batch fails
+    Ok --> Tagged: ModerationDetector, dominant topic
+    Tagged --> Counted: statistics
+    Failed --> [*]: counted per period, excluded
+    Removed --> [*]: counted per rule and period
+    NotDrawn --> [*]
+    Counted --> [*]
+```
+
+1. The loader reads the post, hashes the author and masks the handles and links in the text.
+2. The loader parses the timestamp to UTC. `assign_period` gives the post a period.
 3. The filter rules check the post. A removed post adds one to the count of its rule.
 4. The sampler draws the post into the sample of its period, or not.
 5. The light view masks links and decodes HTML entities.
@@ -232,11 +329,104 @@ flowchart TB
 8. The topic model gives the post its dominant topic.
 9. The statistics count the post in the tables of its period.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as twitter-to-x CLI
+    participant SRC as data/sources.py
+    participant AN as analysis.py
+    participant SC as Scorer
+    participant MD as ModerationDetector
+    participant FS as data/ and results/
+
+    R->>CLI: twitter-to-x prepare --source KIND=PATH
+    CLI->>CLI: load_settings, TTX_SALT or new_salt
+    CLI->>SRC: load_sources(specs, salt)
+    SRC-->>CLI: posts in the post schema
+    CLI->>AN: prepare(posts, cutoff, n_per_period, seed)
+    AN->>AN: validate_posts, assign_period, apply_filters, balanced_periods, light_clean
+    AN-->>CLI: sample and manifest
+    CLI->>FS: write prepared/posts.csv and manifest.json
+    R->>CLI: twitter-to-x analyze --scorer lexicon
+    CLI->>FS: read prepared/posts.csv
+    CLI->>AN: score(df, scorer)
+    AN->>SC: score(texts)
+    SC-->>AN: sentiment, compound, status
+    AN->>MD: match(text) for each post
+    MD-->>AN: flagged, categories
+    AN-->>CLI: scored posts
+    CLI->>FS: write scores.csv without the text column
+    CLI->>AN: analyze(scored, topics, seed, n_boot)
+    AN->>AN: statistics, TopicModel, standardization, regression
+    CLI->>FS: write_report: report.json, report.md
+    CLI-->>R: report in Markdown
+```
+
 ---
 
 ## 5. Data preparation
 
 **Purpose.** Give both periods comparable, anonymized, rule-filtered samples.
+
+The loaders, `data/sources.py`:
+
+```mermaid
+flowchart LR
+    SPEC[/"--source KIND=PATH"/] --> K{"KIND"}
+    K -- "sentiment140" --> S140["load_sentiment140<br/>PDT date to UTC, source_label"]
+    K -- "x_parquet" --> XP["load_x_parquet<br/>text, datetime, encoded user"]
+    K -- "csv" --> CSV["load_csv<br/>text, created_at, optional author,<br/>post_id and true_ columns"]
+    K -- "other" --> ERR[/"ValueError"/]
+    S140 --> FR["_frame<br/>mask_text, hash_author"]
+    XP --> FR
+    CSV --> FR
+    FR --> VP{"validate_posts<br/>columns, timestamps,<br/>unique post ids"}
+    VP -- "fails" --> SE[/"SchemaError"/]
+    VP -- "passes, blank text dropped" --> AP["assign_period<br/>post on or after the cutoff day, UTC"]
+    AP --> OUT[/"Posts with a period"/]
+```
+
+The filter rules, `data/filters.py`:
+
+```mermaid
+flowchart TD
+    IN[/"Posts with a period"/] --> N["Normalize the text<br/>lower case, non-word to space"]
+    N --> E{"Empty?"}
+    E -- "yes" --> R1["empty"]
+    E -- "no" --> B{"Same known author and text<br/>more than 3 times?"}
+    B -- "yes" --> R2["repeated_author_text<br/>all copies"]
+    B -- "no" --> D{"Text seen before?"}
+    D -- "yes" --> R3["duplicate_text<br/>later copies"]
+    D -- "no" --> EN{"is_english?<br/>80 % Latin letters and<br/>a common English word"}
+    EN -- "no" --> R4["not_english"]
+    EN -- "yes" --> SP{"is_spam?<br/>spam pattern, 6 or more hashtags,<br/>3 or more links"}
+    SP -- "yes" --> R5["spam_pattern"]
+    SP -- "no" --> OUT[/"Kept posts"/]
+    R1 --> REP[("FilterReport<br/>removed per rule and period")]
+    R2 --> REP
+    R3 --> REP
+    R4 --> REP
+    R5 --> REP
+```
+
+The sampling and the manifest, `balanced_periods` and `prepare`:
+
+```mermaid
+flowchart TD
+    IN[/"Kept posts, n_per_period, seed"/] --> BOTH{"Both pre and post<br/>present?"}
+    BOTH -- "no" --> ERR[/"ValueError"/]
+    BOTH -- "yes" --> N["n = smaller of n_per_period<br/>and the size of the smaller period"]
+    N --> S["sample_period for pre and for post<br/>random, no replacement, same seed"]
+    S --> LC["light_clean on each text"]
+    LC --> M["Manifest: cutoff, seed, rows and sources<br/>per period, date ranges, filter counts"]
+    M --> SL{"source_label column?"}
+    SL -- "yes" --> SO["Add sortedness of source_label"]
+    SL -- "no" --> OUT[("data/prepared<br/>posts.csv, manifest.json")]
+    SO --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -266,6 +456,38 @@ flowchart TB
 
 **Purpose.** Give each post a sentiment from the light view, with the same scorer for both periods.
 
+```mermaid
+flowchart TD
+    T[/"Light-view texts"/] --> B{"build_scorer"}
+    B -- "lexicon" --> LX["LexiconScorer<br/>offline"]
+    B -- "vader" --> VD["VaderScorer<br/>extra vader"]
+    B -- "transformer" --> TR["TransformerScorer<br/>extra hf, TTX_SENTIMENT_MODEL"]
+    LX --> TH["label_from_compound<br/>threshold 0.05"]
+    VD --> TH
+    TH --> OK[/"sentiment, compound,<br/>status ok"/]
+    TR --> BAT["Batches of TTX_BATCH_SIZE<br/>truncate to 128 tokens"]
+    BAT --> FAIL{"Batch fails?"}
+    FAIL -- "yes" --> ER[/"status error,<br/>no sentiment"/]
+    FAIL -- "no" --> SM["softmax, labels from id2label<br/>through normalize_label"]
+    SM --> AM["label of the highest probability,<br/>compound = p positive - p negative"]
+    AM --> OK
+```
+
+The rules of the `lexicon` scorer, in the sequence that the code applies them:
+
+```mermaid
+flowchart LR
+    T[/"One light-view text"/] --> TOK["Tokens: words and !"]
+    TOK --> V["Valence of each word<br/>69 words"]
+    V --> CAP["x1.5 for capitals<br/>in mixed-case text"]
+    CAP --> INT["x1.3 after an intensifier"]
+    INT --> NEG["x -0.74 after a negator<br/>in the 3 words before"]
+    NEG --> BUT["x1.5 after but,<br/>x0.5 before but"]
+    BUT --> SUM["Sum, then + 0.292 for each !<br/>maximum 3"]
+    SUM --> C["compound = s / sqrt(s² + 15)"]
+    C --> L[/"positive, neutral or negative<br/>threshold 0.05"/]
+```
+
 | Scorer | Method | Extra |
 |---|---|---|
 | `lexicon` | 69 word valences, negation (-0.74) in a 3-word window, intensifiers (x1.3), capitals (x1.5), "but" weighting, "!" emphasis | none |
@@ -284,6 +506,33 @@ flowchart TB
 ## 7. Moderation patterns and topics
 
 **Purpose.** Find moderation talk with known precision, and describe topics in one space for both periods.
+
+The moderation patterns, `ModerationDetector` and `validate-moderation`:
+
+```mermaid
+flowchart LR
+    T[/"Light-view text"/] --> C["For each of the 4 CATEGORIES:<br/>one regex with word boundaries"]
+    C --> F{"Any match?"}
+    F -- "yes" --> M[/"flagged, categories, terms"/]
+    F -- "no" --> N[/"not moderation talk"/]
+    G[/"gold.csv, 60 sentences,<br/>or a --gold file"/] --> EV["evaluate_flags<br/>patterns and substring baseline"]
+    C --> EV
+    EV --> R[/"precision, recall, F1,<br/>Wilson intervals, false positives"/]
+```
+
+The shared topics, `topics.py`:
+
+```mermaid
+flowchart LR
+    T[/"Light-view texts<br/>of BOTH periods"/] --> TV["topic_tokens"]
+    TV --> TF["TfidfVectorizer<br/>1-2 grams, min_df 2, max_df 0.5"]
+    TF --> NMF["One NMF model<br/>k topics, seed TTX_SEED"]
+    NMF --> DOM["Dominant topic of each post<br/>-1 if no weight"]
+    NMF --> DESC["describe: top 8 words,<br/>label of 3 words"]
+    DOM --> PREV["prevalence: share per period,<br/>bootstrap 95 % interval of post - pre"]
+    PREV --> OUT[/"topics and topic_prevalence<br/>in the report"/]
+    DESC --> OUT
+```
 
 | Category | Examples of matched forms |
 |---|---|
@@ -307,6 +556,35 @@ flowchart TB
 ---
 
 ## 8. The statistics
+
+The diagram shows how `analysis.analyze` makes each part of the report from the scored posts.
+
+```mermaid
+flowchart TD
+    S[/"Scored posts: period, sentiment,<br/>status, moderation"/] --> EX["Exclude status error,<br/>count them per period"]
+    EX --> SH["Shares per period<br/>Wilson 95 %"]
+    EX --> CT["contingency<br/>table of integer counts"]
+    CT --> CQ{"chi_square:<br/>counts only?"}
+    CQ -- "no" --> NCE[/"NotCountsError"/]
+    CQ -- "yes" --> CHI["chi2, dof, p, Cramér's V,<br/>smallest expected count"]
+    EX --> MS["Moderation share<br/>diff_ci, Newcombe"]
+    EX --> MO{"Moderation posts<br/>in both periods?"}
+    MO -- "yes" --> MN["Negative share in moderation talk<br/>chi-square and Newcombe"]
+    EX --> TOP["TopicModel<br/>dominant topic"]
+    TOP --> STD["standardized_share_diff<br/>pooled topic weights, bootstrap"]
+    TOP --> REG["logistic_regression<br/>post, moderation, interaction, topic dummies"]
+    EX --> SMD["SMD: length, links,<br/>mentions, hashtags"]
+    EX --> TR{"true_ columns?"}
+    TR -- "yes" --> CHK["check_against_truth"]
+    SH --> REP[/"report.json, report.md"/]
+    CHI --> REP
+    MS --> REP
+    MN --> REP
+    STD --> REP
+    REG --> REP
+    SMD --> REP
+    CHK --> REP
+```
 
 | Output | Method |
 |---|---|
@@ -377,6 +655,22 @@ twitter-to-x flag "my account got suspended" "urban gardening tips"
 
 `python -m twitter_to_x` is the same as the `twitter-to-x` command.
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["twitter-to-x synth"]
+    SYN --> RAW[("data/raw/synthetic_posts.csv")]
+    OWN[/"Your corpora in data/raw"/] --> PRE["twitter-to-x prepare"]
+    RAW --> PRE
+    PRE --> PREP[("data/prepared<br/>posts.csv, manifest.json")]
+    PREP --> AN["twitter-to-x analyze"]
+    AN --> RES[("results/ for each scorer<br/>scores.csv, report.json, report.md")]
+    INS --> VM["twitter-to-x validate-moderation"]
+    INS --> FL["twitter-to-x flag"]
+    INS --> DEMO["twitter-to-x demo<br/>synthetic posts, lexicon, results/demo"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -390,7 +684,17 @@ twitter-to-x flag "my account got suspended" "urban gardening tips"
 | `TTX_BATCH_SIZE` | `transformer` scorer | Posts per batch. Default `64` |
 | `TTX_HF_OFFLINE` | `transformer` scorer | `1` loads the model from the local cache only |
 
-Keep `TTX_SALT` only in a local `.env` file. Git ignores this file. Do not print or commit the salt.
+twitter-to-x reads the variables from the process environment only. It does not load a `.env` file. Keep `TTX_SALT` only in the shell or in a local `.env` file that you export. Git ignores `.env`. Do not print or commit the salt.
+
+```mermaid
+flowchart LR
+    ENV[/"Process environment"/] --> LS["load_settings"]
+    LS --> S{"TTX_SALT set?"}
+    S -- "yes" --> FIX["Same salt in each run<br/>hashes can be linked across runs"]
+    S -- "no" --> NEW["new_salt for each run<br/>no linkage between runs"]
+    FIX --> H["hash_author<br/>HMAC-SHA256, 16 hex characters"]
+    NEW --> H
+```
 
 ---
 
